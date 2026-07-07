@@ -179,6 +179,33 @@ function stepSignature(parts: MessageV2.Part[]): string | undefined {
   return segments.join("\n")
 }
 
+/**
+ * Debounce decision for the high-context-pressure memory-flush nudge.
+ *
+ * Returns true if a nudge (a text part containing `marker`) has already been
+ * injected within the *current high-pressure episode*, where the episode is the
+ * message window since the last checkpoint boundary.
+ *
+ * Keying off the checkpoint boundary rather than a fixed message count is
+ * deliberate: a single sustained high-pressure turn can emit many tool-call
+ * steps — each its own message — so a fixed-size tail would let the
+ * already-nudged message slide out of the window and re-fire the nudge
+ * mid-turn. The boundary only advances when a checkpoint/rebuild actually
+ * discards context, which is exactly when a fresh nudge becomes useful again.
+ *
+ * When `boundaryID` is undefined (no checkpoint yet) or is not found in `msgs`,
+ * the whole conversation is treated as the current episode.
+ */
+export function nudgedSinceBoundary(
+  msgs: readonly MessageV2.WithParts[],
+  boundaryID: string | undefined,
+  marker: string,
+): boolean {
+  const boundaryIdx = boundaryID ? msgs.findIndex((m) => m.info.id === boundaryID) : -1
+  const episode = boundaryIdx >= 0 ? msgs.slice(boundaryIdx) : msgs
+  return episode.some((m) => m.parts.some((p) => p.type === "text" && p.text?.includes(marker)))
+}
+
 const STRUCTURED_OUTPUT_DESCRIPTION = `Use this tool to return your final response in the requested structured format.
 
 IMPORTANT:
@@ -2762,25 +2789,15 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             const cfg = yield* config.get()
             const pressure = pressureLevel({ cfg, tokens: lastFinished.tokens, model })
             if (pressure >= 2) {
-              // De-bounce: nudge at most once per high-pressure *episode*, where
-              // an episode is the message window since the last checkpoint
-              // boundary. Keying off the checkpoint boundary (not a fixed
-              // message count) is deliberate: a single sustained high-pressure
-              // turn can emit many tool-call steps — each its own message — so a
-              // fixed-size tail would let the already-nudged message slide out of
-              // the window and re-fire mid-turn. The boundary only advances when
-              // a checkpoint/rebuild actually discards context, which is exactly
-              // when a fresh nudge becomes useful again. Before the first
-              // checkpoint the boundary is undefined, so we scan all messages.
+              // De-bounce: nudge at most once per high-pressure episode (the
+              // window since the last checkpoint boundary). See
+              // nudgedSinceBoundary for why the boundary — not a fixed message
+              // count — is the right anchor.
               const NUDGE_MARKER = "Context is filling up"
               const boundaryID = yield* checkpoint
                 .lastBoundary(sessionID)
                 .pipe(Effect.catch(() => Effect.succeed(undefined)))
-              const boundaryIdx = boundaryID ? msgs.findIndex((m) => m.info.id === boundaryID) : -1
-              const episode = boundaryIdx >= 0 ? msgs.slice(boundaryIdx) : msgs
-              const alreadyNudged = episode.some((m) =>
-                m.parts.some((p) => p.type === "text" && p.text?.includes(NUDGE_MARKER)),
-              )
+              const alreadyNudged = nudgedSinceBoundary(msgs, boundaryID, NUDGE_MARKER)
               const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
               if (lastUserMsg && !alreadyNudged) {
                 lastUserMsg.parts.push({
